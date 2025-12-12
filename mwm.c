@@ -13,6 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/file.h>
+
+/* PID file for single instance */
+#define PIDFILE "/tmp/mwm.pid"
+static int pidfd = -1;
 
 /* macros */
 #define LENGTH(X)       (sizeof(X) / sizeof(X[0]))
@@ -117,6 +124,7 @@ static void view(const Arg *arg);
 
 /* global variables */
 static int running = 1;
+static int windowschanged = 0;
 static Client *clients = NULL;
 static Client *sel = NULL;
 static Client *lastsel = NULL;
@@ -376,11 +384,8 @@ swapnext(const Arg *arg) {
     if (!c)
         return;
 
-    /* swap positions */
-    CGRect tmp = sel->frame;
-    sel->frame = c->frame;
-    c->frame = tmp;
-
+    /* trigger re-tile */
+    windowschanged = 1;
     arrange();
 }
 
@@ -398,11 +403,7 @@ swapprev(const Arg *arg) {
     if (!last)
         return;
 
-    /* swap positions */
-    CGRect tmp = sel->frame;
-    sel->frame = last->frame;
-    last->frame = tmp;
-
+    windowschanged = 1;
     arrange();
 }
 
@@ -426,12 +427,14 @@ setmfact(const Arg *arg) {
     if (f < 0.1 || f > 0.9)
         return;
     g_mfact = f;
+    windowschanged = 1;
     arrange();
 }
 
 static void
 incnmaster(const Arg *arg) {
     g_nmaster = MAX(0, g_nmaster + arg->i);
+    windowschanged = 1;
     arrange();
 }
 
@@ -439,12 +442,14 @@ static void
 setlayout(const Arg *arg) {
     if (arg->i >= 0 && arg->i < LayoutLast)
         sellay = arg->i;
+    windowschanged = 1;
     arrange();
 }
 
 static void
 cyclelayout(const Arg *arg) {
     sellay = (sellay + 1) % LayoutLast;
+    windowschanged = 1;
     arrange();
 }
 
@@ -453,6 +458,7 @@ togglefloat(const Arg *arg) {
     if (!sel)
         return;
     sel->isfloating = !sel->isfloating;
+    windowschanged = 1;
     arrange();
 }
 
@@ -466,6 +472,7 @@ view(const Arg *arg) {
     printf("mwm: switching to tag %u\n", tagset[seltags]);
     fflush(stdout);
 
+    windowschanged = 1;
     arrange();
 
     /* focus first visible client */
@@ -483,6 +490,7 @@ toggleview(const Arg *arg) {
     unsigned int newtagset = tagset[seltags] ^ (arg->ui & TAGMASK);
     if (newtagset) {
         tagset[seltags] = newtagset;
+        windowschanged = 1;
         arrange();
     }
 }
@@ -494,6 +502,7 @@ tag(const Arg *arg) {
         fflush(stdout);
 
         sel->tags = arg->ui & TAGMASK;
+        windowschanged = 1;
         arrange();
 
         /* focus next visible client */
@@ -586,37 +595,26 @@ monocle(void) {
 }
 
 static void
-showhide(Client *c, int show) {
+hidewindow(Client *c) {
     if (!c || !c->win)
         return;
-
-    if (show) {
-        /* bring window back on screen */
-        movewindow(c->win, c->frame.origin);
-        resizewindow(c->win, c->frame.size);
-    } else {
-        /* move window way off screen to "hide" it */
-        CGPoint offscreen = CGPointMake(-10000, -10000);
-        movewindow(c->win, offscreen);
-    }
+    /* move window way off screen to "hide" it */
+    CGPoint offscreen = CGPointMake(-10000, -10000);
+    movewindow(c->win, offscreen);
 }
 
 static void
 arrange(void) {
-    /* update client list first */
-    updateclients();
-
-    /* hide/show based on tags */
     Client *c;
+
+    /* hide non-visible windows first */
     for (c = clients; c; c = c->next) {
-        if (ISVISIBLE(c)) {
-            showhide(c, 1);  /* show */
-        } else {
-            showhide(c, 0);  /* hide */
+        if (!ISVISIBLE(c)) {
+            hidewindow(c);
         }
     }
 
-    /* apply layout */
+    /* apply layout to visible windows */
     if (layouts[sellay].arrange)
         layouts[sellay].arrange();
 
@@ -754,8 +752,26 @@ updateclients(void) {
 
 static void
 scan(void) {
+    int oldcount = 0, newcount = 0;
+    Client *c;
+
+    /* count current clients */
+    for (c = clients; c; c = c->next)
+        oldcount++;
+
     updateclients();
-    arrange();
+
+    /* count after update */
+    for (c = clients; c; c = c->next)
+        newcount++;
+
+    /* only arrange if window count changed or flag set */
+    if (oldcount != newcount || windowschanged) {
+        printf("mwm: windows changed (%d -> %d), re-arranging\n", oldcount, newcount);
+        fflush(stdout);
+        arrange();
+        windowschanged = 0;
+    }
 }
 
 static CGEventRef
@@ -829,8 +845,51 @@ sighandler(int sig) {
     running = 0;
 }
 
+static int
+acquirelock(void) {
+    pidfd = open(PIDFILE, O_CREAT | O_RDWR, 0644);
+    if (pidfd < 0) {
+        fprintf(stderr, "mwm: cannot open pid file: %s\n", strerror(errno));
+        return 0;
+    }
+
+    if (flock(pidfd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK) {
+            fprintf(stderr, "mwm: another instance is already running\n");
+        } else {
+            fprintf(stderr, "mwm: cannot lock pid file: %s\n", strerror(errno));
+        }
+        close(pidfd);
+        pidfd = -1;
+        return 0;
+    }
+
+    /* write our PID */
+    ftruncate(pidfd, 0);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d\n", getpid());
+    write(pidfd, buf, strlen(buf));
+
+    return 1;
+}
+
+static void
+releaselock(void) {
+    if (pidfd >= 0) {
+        flock(pidfd, LOCK_UN);
+        close(pidfd);
+        unlink(PIDFILE);
+        pidfd = -1;
+    }
+}
+
 static void
 setup(void) {
+    /* single instance check */
+    if (!acquirelock()) {
+        exit(1);
+    }
+
     /* check accessibility permissions - pure C approach */
     CFStringRef keys[] = { kAXTrustedCheckOptionPrompt };
     CFTypeRef values[] = { kCFBooleanTrue };
@@ -900,6 +959,7 @@ cleanup(void) {
     if (evtap)
         CFRelease(evtap);
 
+    releaselock();
     printf("mwm: stopped\n");
 }
 
