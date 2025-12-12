@@ -1,0 +1,956 @@
+/* mwm - minimal window manager for macOS
+ *
+ * A DWM-inspired tiling window manager following suckless philosophy.
+ * Uses macOS Accessibility API for window management.
+ *
+ * (c) 2024 - MIT License
+ */
+
+#include <ApplicationServices/ApplicationServices.h>
+#include <Carbon/Carbon.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/* macros */
+#define LENGTH(X)       (sizeof(X) / sizeof(X[0]))
+#ifndef MAX
+#define MAX(A, B)       ((A) > (B) ? (A) : (B))
+#endif
+#ifndef MIN
+#define MIN(A, B)       ((A) < (B) ? (A) : (B))
+#endif
+#define TAGMASK         ((1 << LENGTH(tags)) - 1)
+#define ISVISIBLE(C)    ((C->tags & tagset[seltags]))
+
+#define TAGKEYS(KEY,TAG) \
+    { MODKEY,           KEY, view,      {.ui = 1 << TAG} }, \
+    { MODKEY|ShiftMask, KEY, tag,       {.ui = 1 << TAG} }, \
+    { MODKEY|CtrlMask,  KEY, toggleview,{.ui = 1 << TAG} },
+
+/* modifier masks */
+#define Mod1        (1 << 0)  /* Option/Alt */
+#define Mod4        (1 << 1)  /* Command */
+#define ShiftMask   (1 << 2)
+#define CtrlMask    (1 << 3)
+
+/* types */
+typedef union {
+    int i;
+    unsigned int ui;
+    float f;
+    const void *v;
+} Arg;
+
+typedef struct {
+    unsigned int mod;
+    unsigned int keycode;
+    void (*func)(const Arg *);
+    Arg arg;
+} Key;
+
+typedef struct {
+    const char *app;
+    unsigned int tags;
+    int isfloating;
+} Rule;
+
+typedef struct Client Client;
+struct Client {
+    char name[256];
+    CGRect frame;
+    AXUIElementRef win;
+    pid_t pid;
+    unsigned int tags;
+    int isfloating;
+    int isfullscreen;
+    Client *next;
+    Client *prev;
+};
+
+typedef struct {
+    const char *symbol;
+    void (*arrange)(void);
+} Layout;
+
+/* function declarations */
+static void arrange(void);
+static int canmanage(AXUIElementRef win);
+static void cleanup(void);
+static void cyclelayout(const Arg *arg);
+static void detach(Client *c);
+static void die(const char *fmt, ...);
+static void focus(Client *c);
+static void focuslast(const Arg *arg);
+static void focusnext(const Arg *arg);
+static void focusprev(const Arg *arg);
+static CGRect getframe(AXUIElementRef win);
+static void grabkeys(void);
+static void incnmaster(const Arg *arg);
+static void killclient(const Arg *arg);
+static void manage(AXUIElementRef win, pid_t pid);
+static void monocle(void);
+static void movewindow(AXUIElementRef win, CGPoint pos);
+static void quit(const Arg *arg);
+static void resizewindow(AXUIElementRef win, CGSize size);
+static void run(void);
+static void scan(void);
+static void setlayout(const Arg *arg);
+static void setmfact(const Arg *arg);
+static void setup(void);
+static void sighandler(int sig);
+static void spawn(const Arg *arg);
+static void swapnext(const Arg *arg);
+static void swapprev(const Arg *arg);
+static void tag(const Arg *arg);
+static void tile(void);
+static void togglefloat(const Arg *arg);
+static void toggleview(const Arg *arg);
+static void unmanage(Client *c);
+static void updateclients(void);
+static void view(const Arg *arg);
+
+/* configuration - include first for constants */
+#include "config.h"
+
+/* global variables */
+static int running = 1;
+static Client *clients = NULL;
+static Client *sel = NULL;
+static Client *lastsel = NULL;
+static CGRect screen;
+static float g_mfact;
+static int g_nmaster;
+static unsigned int seltags = 0;
+static unsigned int tagset[] = {1, 1};
+static int sellay = 0;
+static CFMachPortRef evtap = NULL;
+static CFRunLoopSourceRef rlsrc = NULL;
+
+/* function implementations */
+static void
+die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    exit(1);
+}
+
+static int
+canmanage(AXUIElementRef win) {
+    CFBooleanRef minimized = NULL;
+    CFStringRef subrole = NULL;
+    int result = 0;
+
+    /* skip minimized windows */
+    if (AXUIElementCopyAttributeValue(win, kAXMinimizedAttribute,
+                                       (CFTypeRef *)&minimized) == kAXErrorSuccess) {
+        if (CFBooleanGetValue(minimized)) {
+            CFRelease(minimized);
+            return 0;
+        }
+        CFRelease(minimized);
+    }
+
+    /* check subrole - we want standard windows */
+    if (AXUIElementCopyAttributeValue(win, kAXSubroleAttribute,
+                                       (CFTypeRef *)&subrole) == kAXErrorSuccess) {
+        if (CFStringCompare(subrole, kAXStandardWindowSubrole, 0) == kCFCompareEqualTo) {
+            result = 1;
+        }
+        CFRelease(subrole);
+    }
+
+    return result;
+}
+
+static CGRect
+getframe(AXUIElementRef win) {
+    CGRect frame = CGRectZero;
+    AXValueRef posval = NULL, sizeval = NULL;
+    CGPoint pos;
+    CGSize size;
+
+    if (AXUIElementCopyAttributeValue(win, kAXPositionAttribute,
+                                       (CFTypeRef *)&posval) == kAXErrorSuccess) {
+        AXValueGetValue(posval, kAXValueCGPointType, &pos);
+        CFRelease(posval);
+        frame.origin = pos;
+    }
+
+    if (AXUIElementCopyAttributeValue(win, kAXSizeAttribute,
+                                       (CFTypeRef *)&sizeval) == kAXErrorSuccess) {
+        AXValueGetValue(sizeval, kAXValueCGSizeType, &size);
+        CFRelease(sizeval);
+        frame.size = size;
+    }
+
+    return frame;
+}
+
+static void
+movewindow(AXUIElementRef win, CGPoint pos) {
+    AXValueRef posval = AXValueCreate(kAXValueCGPointType, &pos);
+    if (posval) {
+        AXUIElementSetAttributeValue(win, kAXPositionAttribute, posval);
+        CFRelease(posval);
+    }
+}
+
+static void
+resizewindow(AXUIElementRef win, CGSize size) {
+    AXValueRef sizeval = AXValueCreate(kAXValueCGSizeType, &size);
+    if (sizeval) {
+        AXUIElementSetAttributeValue(win, kAXSizeAttribute, sizeval);
+        CFRelease(sizeval);
+    }
+}
+
+static void
+manage(AXUIElementRef win, pid_t pid) {
+    Client *c;
+    CFStringRef titleref = NULL;
+    ProcessSerialNumber psn;
+    CFStringRef appname = NULL;
+
+    c = calloc(1, sizeof(Client));
+    if (!c)
+        die("mwm: cannot allocate memory\n");
+
+    c->win = win;
+    CFRetain(win);
+    c->pid = pid;
+    c->tags = tagset[seltags];
+    c->isfloating = 0;
+    c->frame = getframe(win);
+    c->name[0] = '\0';
+
+    /* get window title */
+    if (AXUIElementCopyAttributeValue(win, kAXTitleAttribute,
+                                       (CFTypeRef *)&titleref) == kAXErrorSuccess) {
+        CFStringGetCString(titleref, c->name, sizeof(c->name), kCFStringEncodingUTF8);
+        CFRelease(titleref);
+    }
+
+    /* apply rules */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    GetProcessForPID(pid, &psn);
+    CopyProcessName(&psn, &appname);
+#pragma clang diagnostic pop
+
+    if (appname) {
+        char app[256];
+        CFStringGetCString(appname, app, sizeof(app), kCFStringEncodingUTF8);
+        CFRelease(appname);
+
+        for (size_t i = 0; i < LENGTH(rules); i++) {
+            if (strstr(app, rules[i].app)) {
+                if (rules[i].tags)
+                    c->tags = rules[i].tags;
+                c->isfloating = rules[i].isfloating;
+                break;
+            }
+        }
+    }
+
+    /* attach to client list */
+    c->next = clients;
+    if (clients)
+        clients->prev = c;
+    clients = c;
+
+    focus(c);
+}
+
+static void
+unmanage(Client *c) {
+    detach(c);
+    if (c->win)
+        CFRelease(c->win);
+    if (sel == c) {
+        sel = clients;
+        if (sel)
+            focus(sel);
+    }
+    free(c);
+}
+
+static void
+detach(Client *c) {
+    if (c->prev)
+        c->prev->next = c->next;
+    if (c->next)
+        c->next->prev = c->prev;
+    if (c == clients)
+        clients = c->next;
+    c->next = c->prev = NULL;
+}
+
+static void
+focus(Client *c) {
+    if (sel && sel != c)
+        lastsel = sel;
+
+    sel = c;
+
+    if (!c)
+        return;
+
+    /* raise and focus the window */
+    AXUIElementSetAttributeValue(c->win, kAXMainAttribute, kCFBooleanTrue);
+    AXUIElementSetAttributeValue(c->win, kAXFocusedAttribute, kCFBooleanTrue);
+
+    /* bring app to front */
+    AXUIElementRef app = AXUIElementCreateApplication(c->pid);
+    if (app) {
+        AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
+        CFRelease(app);
+    }
+}
+
+static void
+focusnext(const Arg *arg) {
+    Client *c;
+
+    if (!sel)
+        return;
+
+    /* find next visible client */
+    for (c = sel->next; c; c = c->next)
+        if (ISVISIBLE(c))
+            break;
+
+    if (!c) {
+        for (c = clients; c && c != sel; c = c->next)
+            if (ISVISIBLE(c))
+                break;
+    }
+
+    if (c && c != sel)
+        focus(c);
+}
+
+static void
+focusprev(const Arg *arg) {
+    Client *c, *last = NULL;
+
+    if (!sel)
+        return;
+
+    /* find previous visible client */
+    for (c = clients; c != sel; c = c->next)
+        if (ISVISIBLE(c))
+            last = c;
+
+    if (!last) {
+        for (c = sel->next; c; c = c->next)
+            if (ISVISIBLE(c))
+                last = c;
+    }
+
+    if (last && last != sel)
+        focus(last);
+}
+
+static void
+focuslast(const Arg *arg) {
+    if (lastsel && ISVISIBLE(lastsel))
+        focus(lastsel);
+}
+
+static void
+swapnext(const Arg *arg) {
+    Client *c;
+
+    if (!sel || sel->isfloating)
+        return;
+
+    for (c = sel->next; c; c = c->next)
+        if (ISVISIBLE(c) && !c->isfloating)
+            break;
+
+    if (!c)
+        return;
+
+    /* swap positions */
+    CGRect tmp = sel->frame;
+    sel->frame = c->frame;
+    c->frame = tmp;
+
+    arrange();
+}
+
+static void
+swapprev(const Arg *arg) {
+    Client *c, *last = NULL;
+
+    if (!sel || sel->isfloating)
+        return;
+
+    for (c = clients; c != sel; c = c->next)
+        if (ISVISIBLE(c) && !c->isfloating)
+            last = c;
+
+    if (!last)
+        return;
+
+    /* swap positions */
+    CGRect tmp = sel->frame;
+    sel->frame = last->frame;
+    last->frame = tmp;
+
+    arrange();
+}
+
+static void
+killclient(const Arg *arg) {
+    if (!sel)
+        return;
+
+    /* try graceful close first */
+    AXUIElementRef closebutton = NULL;
+    if (AXUIElementCopyAttributeValue(sel->win, kAXCloseButtonAttribute,
+                                       (CFTypeRef *)&closebutton) == kAXErrorSuccess) {
+        AXUIElementPerformAction(closebutton, kAXPressAction);
+        CFRelease(closebutton);
+    }
+}
+
+static void
+setmfact(const Arg *arg) {
+    float f = g_mfact + arg->f;
+    if (f < 0.1 || f > 0.9)
+        return;
+    g_mfact = f;
+    arrange();
+}
+
+static void
+incnmaster(const Arg *arg) {
+    g_nmaster = MAX(0, g_nmaster + arg->i);
+    arrange();
+}
+
+static void
+setlayout(const Arg *arg) {
+    if (arg->i >= 0 && arg->i < LayoutLast)
+        sellay = arg->i;
+    arrange();
+}
+
+static void
+cyclelayout(const Arg *arg) {
+    sellay = (sellay + 1) % LayoutLast;
+    arrange();
+}
+
+static void
+togglefloat(const Arg *arg) {
+    if (!sel)
+        return;
+    sel->isfloating = !sel->isfloating;
+    arrange();
+}
+
+static void
+view(const Arg *arg) {
+    if ((arg->ui & TAGMASK) == tagset[seltags])
+        return;
+    seltags ^= 1;
+    tagset[seltags] = arg->ui & TAGMASK;
+
+    printf("mwm: switching to tag %u\n", tagset[seltags]);
+    fflush(stdout);
+
+    arrange();
+
+    /* focus first visible client */
+    Client *c;
+    for (c = clients; c; c = c->next) {
+        if (ISVISIBLE(c)) {
+            focus(c);
+            break;
+        }
+    }
+}
+
+static void
+toggleview(const Arg *arg) {
+    unsigned int newtagset = tagset[seltags] ^ (arg->ui & TAGMASK);
+    if (newtagset) {
+        tagset[seltags] = newtagset;
+        arrange();
+    }
+}
+
+static void
+tag(const Arg *arg) {
+    if (sel && arg->ui & TAGMASK) {
+        printf("mwm: moving window '%s' to tag %u\n", sel->name, arg->ui);
+        fflush(stdout);
+
+        sel->tags = arg->ui & TAGMASK;
+        arrange();
+
+        /* focus next visible client */
+        Client *c;
+        for (c = clients; c; c = c->next) {
+            if (ISVISIBLE(c)) {
+                focus(c);
+                break;
+            }
+        }
+    }
+}
+
+static void
+tile(void) {
+    unsigned int n = 0, i = 0;
+    Client *c;
+    int mx, my, mw, mh;
+    int sx, sy, sw, sh;
+    int gap = gappx;
+
+    /* count tiled clients */
+    for (c = clients; c; c = c->next)
+        if (ISVISIBLE(c) && !c->isfloating)
+            n++;
+
+    if (n == 0)
+        return;
+
+    /* calculate areas */
+    mx = screen.origin.x + gap;
+    my = screen.origin.y + gap;
+
+    if (n <= (unsigned int)g_nmaster) {
+        /* all in master */
+        mw = screen.size.width - 2 * gap;
+        mh = (screen.size.height - (n + 1) * gap) / n;
+    } else {
+        /* master + stack */
+        mw = (screen.size.width - 3 * gap) * g_mfact;
+        mh = (screen.size.height - (g_nmaster + 1) * gap) / g_nmaster;
+        sx = mx + mw + gap;
+        sy = my;
+        sw = screen.size.width - mw - 3 * gap;
+        sh = (screen.size.height - (n - g_nmaster + 1) * gap) / (n - g_nmaster);
+    }
+
+    /* arrange clients */
+    for (c = clients; c; c = c->next) {
+        if (!ISVISIBLE(c))
+            continue;
+
+        if (c->isfloating)
+            continue;
+
+        if (i < (unsigned int)g_nmaster) {
+            /* master area */
+            CGPoint pos = CGPointMake(mx, my + i * (mh + gap));
+            CGSize size = CGSizeMake(n <= (unsigned int)g_nmaster ? mw : mw, mh);
+            movewindow(c->win, pos);
+            resizewindow(c->win, size);
+            c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+        } else {
+            /* stack area */
+            CGPoint pos = CGPointMake(sx, sy + (i - g_nmaster) * (sh + gap));
+            CGSize size = CGSizeMake(sw, sh);
+            movewindow(c->win, pos);
+            resizewindow(c->win, size);
+            c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+        }
+        i++;
+    }
+}
+
+static void
+monocle(void) {
+    Client *c;
+    int gap = gappx;
+
+    for (c = clients; c; c = c->next) {
+        if (!ISVISIBLE(c) || c->isfloating)
+            continue;
+
+        CGPoint pos = CGPointMake(screen.origin.x + gap, screen.origin.y + gap);
+        CGSize size = CGSizeMake(screen.size.width - 2 * gap, screen.size.height - 2 * gap);
+        movewindow(c->win, pos);
+        resizewindow(c->win, size);
+        c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+    }
+}
+
+static void
+showhide(Client *c, int show) {
+    if (!c || !c->win)
+        return;
+
+    if (show) {
+        /* bring window back on screen */
+        movewindow(c->win, c->frame.origin);
+        resizewindow(c->win, c->frame.size);
+    } else {
+        /* move window way off screen to "hide" it */
+        CGPoint offscreen = CGPointMake(-10000, -10000);
+        movewindow(c->win, offscreen);
+    }
+}
+
+static void
+arrange(void) {
+    /* update client list first */
+    updateclients();
+
+    /* hide/show based on tags */
+    Client *c;
+    for (c = clients; c; c = c->next) {
+        if (ISVISIBLE(c)) {
+            showhide(c, 1);  /* show */
+        } else {
+            showhide(c, 0);  /* hide */
+        }
+    }
+
+    /* apply layout */
+    if (layouts[sellay].arrange)
+        layouts[sellay].arrange();
+
+    /* focus selected */
+    if (sel && ISVISIBLE(sel))
+        focus(sel);
+    else {
+        /* find first visible client to focus */
+        for (c = clients; c; c = c->next) {
+            if (ISVISIBLE(c)) {
+                focus(c);
+                break;
+            }
+        }
+    }
+}
+
+static void
+spawn(const Arg *arg) {
+    const char **cmd = (const char **)arg->v;
+    if (!cmd || !cmd[0])
+        return;
+
+    printf("mwm: spawning %s\n", cmd[0]);
+    fflush(stdout);
+
+    /* use open command for .app bundles */
+    if (strstr(cmd[0], ".app")) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "open \"%s\"", cmd[0]);
+        int ret = system(buf);
+        if (ret != 0) {
+            fprintf(stderr, "mwm: spawn failed with %d\n", ret);
+        }
+    } else {
+        if (fork() == 0) {
+            setsid();
+            execvp(cmd[0], (char *const *)cmd);
+            die("mwm: execvp %s failed\n", cmd[0]);
+        }
+    }
+}
+
+static void
+quit(const Arg *arg) {
+    running = 0;
+}
+
+static void
+updateclients(void) {
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID
+    );
+
+    if (!windowList)
+        return;
+
+    /* mark all clients as stale */
+    Client *c, *next;
+    for (c = clients; c; c = c->next)
+        c->isfullscreen = -1;  /* using as "stale" marker */
+
+    CFIndex count = CFArrayGetCount(windowList);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef wininfo = CFArrayGetValueAtIndex(windowList, i);
+
+        CFNumberRef pidref = CFDictionaryGetValue(wininfo, kCGWindowOwnerPID);
+        CFNumberRef layerref = CFDictionaryGetValue(wininfo, kCGWindowLayer);
+
+        if (!pidref || !layerref)
+            continue;
+
+        pid_t pid;
+        int layer;
+        CFNumberGetValue(pidref, kCFNumberIntType, &pid);
+        CFNumberGetValue(layerref, kCFNumberIntType, &layer);
+
+        /* skip non-standard layers */
+        if (layer != 0)
+            continue;
+
+        /* get AX element for window */
+        AXUIElementRef app = AXUIElementCreateApplication(pid);
+        if (!app)
+            continue;
+
+        CFArrayRef appwindows = NULL;
+        if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute,
+                                          (CFTypeRef *)&appwindows) != kAXErrorSuccess) {
+            CFRelease(app);
+            continue;
+        }
+
+        CFIndex wcount = CFArrayGetCount(appwindows);
+        for (CFIndex j = 0; j < wcount; j++) {
+            AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(appwindows, j);
+
+            if (!canmanage(win))
+                continue;
+
+            /* check if already managed */
+            int found = 0;
+            for (c = clients; c; c = c->next) {
+                if (c->pid == pid) {
+                    CGRect f1 = getframe(win);
+                    CGRect f2 = getframe(c->win);
+                    if (CGRectEqualToRect(f1, f2)) {
+                        c->isfullscreen = 0;  /* mark as active */
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+
+            if (!found)
+                manage(win, pid);
+        }
+
+        CFRelease(appwindows);
+        CFRelease(app);
+    }
+
+    CFRelease(windowList);
+
+    /* remove stale clients */
+    for (c = clients; c; c = next) {
+        next = c->next;
+        if (c->isfullscreen == -1)
+            unmanage(c);
+        else
+            c->isfullscreen = 0;
+    }
+}
+
+static void
+scan(void) {
+    updateclients();
+    arrange();
+}
+
+static CGEventRef
+eventcallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+    static int eventcount = 0;
+
+    if (type == kCGEventKeyDown) {
+        CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        CGEventFlags flags = CGEventGetFlags(event);
+
+        unsigned int mod = 0;
+        if (flags & kCGEventFlagMaskAlternate)  mod |= Mod1;
+        if (flags & kCGEventFlagMaskCommand)    mod |= Mod4;
+        if (flags & kCGEventFlagMaskShift)      mod |= ShiftMask;
+        if (flags & kCGEventFlagMaskControl)    mod |= CtrlMask;
+
+        /* debug: show all key events with Option held */
+        if (mod & Mod1) {
+            printf("mwm: Option+key detected - keycode=%d (0x%02X) mod=%u\n",
+                   keycode, keycode, mod);
+            fflush(stdout);
+        }
+
+        for (size_t i = 0; i < LENGTH(keys); i++) {
+            if (keys[i].keycode == keycode && keys[i].mod == mod) {
+                printf("mwm: executing binding for keycode=%d\n", keycode);
+                fflush(stdout);
+                keys[i].func(&keys[i].arg);
+                return NULL;  /* consume event */
+            }
+        }
+    } else if (type == kCGEventTapDisabledByTimeout ||
+               type == kCGEventTapDisabledByUserInput) {
+        printf("mwm: event tap was disabled, re-enabling\n");
+        fflush(stdout);
+        CGEventTapEnable(evtap, true);
+    }
+
+    /* periodic status every 100 events */
+    if (++eventcount % 100 == 0) {
+        printf("mwm: processed %d events\n", eventcount);
+        fflush(stdout);
+    }
+
+    return event;
+}
+
+static void
+grabkeys(void) {
+    CGEventMask mask = CGEventMaskBit(kCGEventKeyDown);
+
+    evtap = CGEventTapCreate(
+        kCGSessionEventTap,
+        kCGHeadInsertEventTap,
+        kCGEventTapOptionDefault,
+        mask,
+        eventcallback,
+        NULL
+    );
+
+    if (!evtap)
+        die("mwm: failed to create event tap. Check accessibility permissions.\n");
+
+    rlsrc = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, evtap, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), rlsrc, kCFRunLoopCommonModes);
+    CGEventTapEnable(evtap, true);
+}
+
+static void
+sighandler(int sig) {
+    running = 0;
+}
+
+static void
+setup(void) {
+    /* check accessibility permissions - pure C approach */
+    CFStringRef keys[] = { kAXTrustedCheckOptionPrompt };
+    CFTypeRef values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(
+        kCFAllocatorDefault,
+        (const void **)keys,
+        (const void **)values,
+        1,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    Boolean trusted = AXIsProcessTrustedWithOptions(options);
+    CFRelease(options);
+
+    if (!trusted) {
+        fprintf(stderr, "mwm: Accessibility permissions required.\n");
+        fprintf(stderr, "     Go to System Settings → Privacy & Security → Accessibility\n");
+        fprintf(stderr, "     and add mwm to the allowed apps.\n");
+    }
+
+    /* get screen size */
+    CGDirectDisplayID mainDisplay = CGMainDisplayID();
+    screen = CGDisplayBounds(mainDisplay);
+
+    /* account for menu bar (approximate) */
+    screen.origin.y += 25;
+    screen.size.height -= 25;
+
+    /* get dock info and adjust */
+    /* TODO: properly detect dock position and size */
+    screen.size.height -= 70;  /* approximate dock height */
+
+    /* initialize state */
+    g_mfact = DEFAULT_MFACT;
+    g_nmaster = DEFAULT_NMASTER;
+    tagset[0] = tagset[1] = 1;
+    sellay = 0;
+
+    /* signal handlers */
+    signal(SIGINT, sighandler);
+    signal(SIGTERM, sighandler);
+
+    /* grab keys */
+    grabkeys();
+
+    printf("mwm: started\n");
+    printf("     screen: %.0fx%.0f @ (%.0f,%.0f)\n",
+           screen.size.width, screen.size.height,
+           screen.origin.x, screen.origin.y);
+}
+
+static void
+cleanup(void) {
+    Client *c, *next;
+
+    for (c = clients; c; c = next) {
+        next = c->next;
+        if (c->win)
+            CFRelease(c->win);
+        free(c);
+    }
+
+    if (rlsrc) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), rlsrc, kCFRunLoopCommonModes);
+        CFRelease(rlsrc);
+    }
+    if (evtap)
+        CFRelease(evtap);
+
+    printf("mwm: stopped\n");
+}
+
+/* periodic timer callback to scan for windows */
+static void
+timercallback(CFRunLoopTimerRef timer, void *info) {
+    scan();
+}
+
+static void
+run(void) {
+    /* create timer to periodically scan windows */
+    CFRunLoopTimerRef timer = CFRunLoopTimerCreate(
+        kCFAllocatorDefault,
+        CFAbsoluteTimeGetCurrent(),
+        1.0,  /* scan every second */
+        0, 0,
+        timercallback,
+        NULL
+    );
+    CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, kCFRunLoopCommonModes);
+
+    /* initial scan */
+    scan();
+
+    /* main event loop */
+    while (running) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+    }
+
+    CFRunLoopTimerInvalidate(timer);
+    CFRelease(timer);
+}
+
+int
+main(int argc, char *argv[]) {
+    if (argc > 1) {
+        if (!strcmp(argv[1], "-v") || !strcmp(argv[1], "--version")) {
+            printf("mwm-0.1\n");
+            return 0;
+        }
+        if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+            printf("usage: mwm [-v] [-h]\n");
+            return 0;
+        }
+    }
+
+    setup();
+    run();
+    cleanup();
+
+    return 0;
+}
+
