@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/file.h>
+#include "statusbar.h"
 
 /* PID file for single instance */
 #define PIDFILE "/tmp/mwm.pid"
@@ -117,6 +118,7 @@ static void togglefloat(const Arg *arg);
 static void toggleview(const Arg *arg);
 static void unmanage(Client *c);
 static void updateclients(void);
+static void updatestatusbar(void);
 static void view(const Arg *arg);
 
 /* configuration - include first for constants */
@@ -145,6 +147,25 @@ die(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     exit(1);
+}
+
+static void
+updatestatusbar(void) {
+    /* calculate current tag number (1-based) from bitmask */
+    int tag = 1;
+    unsigned int t = tagset[seltags];
+    while (t > 1) {
+        t >>= 1;
+        tag++;
+    }
+
+    /* get current layout symbol */
+    const char *layout = layouts[sellay].symbol;
+
+    /* get current window name */
+    const char *window = sel ? sel->name : NULL;
+
+    statusbar_update(tag, layout, window);
 }
 
 static int
@@ -305,8 +326,10 @@ focus(Client *c) {
 
     sel = c;
 
-    if (!c)
+    if (!c) {
+        updatestatusbar();
         return;
+    }
 
     /* raise and focus the window */
     AXUIElementSetAttributeValue(c->win, kAXMainAttribute, kCFBooleanTrue);
@@ -318,6 +341,8 @@ focus(Client *c) {
         AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
         CFRelease(app);
     }
+
+    updatestatusbar();
 }
 
 static void
@@ -469,8 +494,10 @@ view(const Arg *arg) {
     seltags ^= 1;
     tagset[seltags] = arg->ui & TAGMASK;
 
+#ifdef DEBUG
     printf("mwm: switching to tag %u\n", tagset[seltags]);
     fflush(stdout);
+#endif
 
     windowschanged = 1;
     arrange();
@@ -498,8 +525,10 @@ toggleview(const Arg *arg) {
 static void
 tag(const Arg *arg) {
     if (sel && arg->ui & TAGMASK) {
+#ifdef DEBUG
         printf("mwm: moving window '%s' to tag %u\n", sel->name, arg->ui);
         fflush(stdout);
+#endif
 
         sel->tags = arg->ui & TAGMASK;
         windowschanged = 1;
@@ -630,6 +659,8 @@ arrange(void) {
             }
         }
     }
+
+    updatestatusbar();
 }
 
 static void
@@ -638,7 +669,9 @@ spawn(const Arg *arg) {
     if (!cmd || !cmd[0])
         return;
 
+#ifdef DEBUG
     printf("mwm: spawning %s\n", cmd[0]);
+#endif
     fflush(stdout);
 
     /* use open command for .app bundles */
@@ -767,8 +800,10 @@ scan(void) {
 
     /* only arrange if window count changed or flag set */
     if (oldcount != newcount || windowschanged) {
+#ifdef DEBUG
         printf("mwm: windows changed (%d -> %d), re-arranging\n", oldcount, newcount);
         fflush(stdout);
+#endif
         arrange();
         windowschanged = 0;
     }
@@ -776,7 +811,9 @@ scan(void) {
 
 static CGEventRef
 eventcallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *refcon) {
+#ifdef DEBUG
     static int eventcount = 0;
+#endif
 
     if (type == kCGEventKeyDown) {
         CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
@@ -788,33 +825,41 @@ eventcallback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *r
         if (flags & kCGEventFlagMaskShift)      mod |= ShiftMask;
         if (flags & kCGEventFlagMaskControl)    mod |= CtrlMask;
 
+#ifdef DEBUG
         /* debug: show all key events with Option held */
         if (mod & Mod1) {
             printf("mwm: Option+key detected - keycode=%d (0x%02X) mod=%u\n",
                    keycode, keycode, mod);
             fflush(stdout);
         }
+#endif
 
         for (size_t i = 0; i < LENGTH(keys); i++) {
             if (keys[i].keycode == keycode && keys[i].mod == mod) {
+#ifdef DEBUG
                 printf("mwm: executing binding for keycode=%d\n", keycode);
                 fflush(stdout);
+#endif
                 keys[i].func(&keys[i].arg);
                 return NULL;  /* consume event */
             }
         }
     } else if (type == kCGEventTapDisabledByTimeout ||
                type == kCGEventTapDisabledByUserInput) {
+#ifdef DEBUG
         printf("mwm: event tap was disabled, re-enabling\n");
         fflush(stdout);
+#endif
         CGEventTapEnable(evtap, true);
     }
 
+#ifdef DEBUG
     /* periodic status every 100 events */
     if (++eventcount % 100 == 0) {
         printf("mwm: processed %d events\n", eventcount);
         fflush(stdout);
     }
+#endif
 
     return event;
 }
@@ -935,6 +980,9 @@ setup(void) {
     /* grab keys */
     grabkeys();
 
+    /* initialize status bar */
+    statusbar_init();
+
     printf("mwm: started\n");
     printf("     screen: %.0fx%.0f @ (%.0f,%.0f)\n",
            screen.size.width, screen.size.height,
@@ -959,6 +1007,7 @@ cleanup(void) {
     if (evtap)
         CFRelease(evtap);
 
+    statusbar_cleanup();
     releaselock();
     printf("mwm: stopped\n");
 }

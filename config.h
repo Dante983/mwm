@@ -5,6 +5,9 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+/* debug output (comment out to disable) */
+// #define DEBUG 1
+
 /* appearance */
 #define DEFAULT_MFACT   0.55f  /* master area size [0.05..0.95] */
 #define DEFAULT_NMASTER 1      /* number of clients in master area */

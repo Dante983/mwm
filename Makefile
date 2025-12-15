@@ -4,19 +4,27 @@ VERSION = 0.1
 
 CC = clang
 CFLAGS = -Wall -Wextra -Wno-unused-parameter -O2 -std=c11
-LDFLAGS = -framework ApplicationServices -framework Carbon
+OBJCFLAGS = -Wall -Wextra -O2
+LDFLAGS = -framework ApplicationServices -framework Carbon -framework Cocoa
 
 PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 LAUNCHDIR = $(HOME)/Library/LaunchAgents
 
 SRC = mwm.c
-OBJ = $(SRC:.c=.o)
+OBJC_SRC = statusbar.m
+OBJ = mwm.o statusbar.o
 
 all: mwm
 
-mwm: $(SRC) config.h
-	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+mwm: $(OBJ)
+	$(CC) -o $@ $(OBJ) $(LDFLAGS)
+
+mwm.o: mwm.c config.h statusbar.h
+	$(CC) $(CFLAGS) -c -o $@ mwm.c
+
+statusbar.o: statusbar.m statusbar.h
+	$(CC) $(OBJCFLAGS) -c -o $@ statusbar.m
 
 clean:
 	rm -f mwm $(OBJ)
@@ -31,16 +39,33 @@ install: mwm
 enable:
 	mkdir -p $(LAUNCHDIR)
 	cp -f com.local.mwm.plist $(LAUNCHDIR)/
-	launchctl load $(LAUNCHDIR)/com.local.mwm.plist
+	launchctl bootstrap gui/$$(id -u) $(LAUNCHDIR)/com.local.mwm.plist
 	@echo "mwm will now start at login"
 
 disable:
-	-launchctl unload $(LAUNCHDIR)/com.local.mwm.plist
+	-launchctl bootout gui/$$(id -u)/com.local.mwm
 	rm -f $(LAUNCHDIR)/com.local.mwm.plist
 	@echo "mwm disabled from login"
+
+start:
+	@if pgrep -x mwm > /dev/null; then \
+		echo "mwm is already running"; \
+	else \
+		launchctl bootstrap gui/$$(id -u) $(LAUNCHDIR)/com.local.mwm.plist 2>/dev/null || $(BINDIR)/mwm & \
+		echo "mwm started"; \
+	fi
+
+stop:
+	-launchctl bootout gui/$$(id -u)/com.local.mwm 2>/dev/null
+	-pkill -x mwm
+	@echo "mwm stopped"
+
+restart: stop
+	@sleep 1
+	@$(MAKE) start
 
 uninstall: disable
 	rm -f $(DESTDIR)$(BINDIR)/mwm
 
-.PHONY: all clean install uninstall enable disable
+.PHONY: all clean install uninstall enable disable start stop restart
 

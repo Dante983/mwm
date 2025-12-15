@@ -46,6 +46,31 @@ sudo make install
 make enable
 ```
 
+## Starting & Stopping
+
+| Command | Action |
+|---------|--------|
+| `make start` | Start mwm |
+| `make stop` | Stop mwm |
+| `make restart` | Restart mwm |
+| `make enable` | Install + start at login |
+| `make disable` | Stop + remove from login |
+| `⌥ + ⇧ + q` | Quit via hotkey |
+
+### Manual Control
+
+```bash
+# Start in background
+/usr/local/bin/mwm &
+
+# Stop
+pkill mwm
+
+# Using launchctl directly
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.mwm.plist
+launchctl bootout gui/$(id -u)/com.local.mwm
+```
+
 ## Permissions
 
 mwm requires Accessibility permissions to control windows:
