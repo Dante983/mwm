@@ -16,11 +16,16 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include "statusbar.h"
+#include "cJSON.h"
 
 /* PID file for single instance */
 #define PIDFILE "/tmp/mwm.pid"
 static int pidfd = -1;
+
+/* State file for window persistence */
+#define STATEFILE "/tmp/mwm-state.json"
 
 /* macros */
 #define LENGTH(X)       (sizeof(X) / sizeof(X[0]))
@@ -104,6 +109,9 @@ static void movewindow(AXUIElementRef win, CGPoint pos);
 static void quit(const Arg *arg);
 static void resizewindow(AXUIElementRef win, CGSize size);
 static void run(void);
+static void loadstate(void);
+static int restorestate(const char *appname, unsigned int *tags, int *floating);
+static void savestate(void);
 static void scan(void);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
@@ -276,6 +284,7 @@ manage(AXUIElementRef win, pid_t pid) {
         CFStringGetCString(appname, app, sizeof(app), kCFStringEncodingUTF8);
         CFRelease(appname);
 
+        /* apply rules from config.h */
         for (size_t i = 0; i < LENGTH(rules); i++) {
             if (strstr(app, rules[i].app)) {
                 if (rules[i].tags)
@@ -283,6 +292,20 @@ manage(AXUIElementRef win, pid_t pid) {
                 c->isfloating = rules[i].isfloating;
                 break;
             }
+        }
+
+        /* restore saved state (overrides rules) */
+        unsigned int saved_tags = 0;
+        int saved_floating = 0;
+        if (restorestate(app, &saved_tags, &saved_floating)) {
+            if (saved_tags)
+                c->tags = saved_tags;
+            c->isfloating = saved_floating;
+#ifdef DEBUG
+            printf("mwm: restored state for '%s' -> tags=%u, floating=%d\n",
+                   app, c->tags, c->isfloating);
+            fflush(stdout);
+#endif
         }
     }
 
@@ -485,6 +508,7 @@ togglefloat(const Arg *arg) {
     sel->isfloating = !sel->isfloating;
     windowschanged = 1;
     arrange();
+    savestate();  /* save window state after float toggle */
 }
 
 static void
@@ -533,6 +557,7 @@ tag(const Arg *arg) {
         sel->tags = arg->ui & TAGMASK;
         windowschanged = 1;
         arrange();
+        savestate();  /* save window state after tag change */
 
         /* focus next visible client */
         Client *c;
@@ -929,6 +954,148 @@ releaselock(void) {
 }
 
 static void
+savestate(void) {
+#ifdef DEBUG
+    printf("mwm: savestate() called\n");
+    fflush(stdout);
+#endif
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *windows = cJSON_CreateArray();
+
+    /* iterate through all clients and save their state */
+    for (Client *c = clients; c; c = c->next) {
+        /* get application name from window */
+        char app[256] = {0};
+        CFStringRef appname = NULL;
+        pid_t pid = c->pid;
+
+        ProcessSerialNumber psn;
+        if (GetProcessForPID(pid, &psn) == noErr) {
+            CopyProcessName(&psn, &appname);
+            if (appname) {
+                CFStringGetCString(appname, app, sizeof(app), kCFStringEncodingUTF8);
+                CFRelease(appname);
+            }
+        }
+
+        if (app[0] == '\0')
+            continue;
+
+        /* create window entry */
+        cJSON *window = cJSON_CreateObject();
+        cJSON_AddStringToObject(window, "app", app);
+        cJSON_AddNumberToObject(window, "tags", c->tags);
+        cJSON_AddNumberToObject(window, "floating", c->isfloating);
+        cJSON_AddItemToArray(windows, window);
+
+#ifdef DEBUG
+        printf("mwm: saving state for '%s' -> tags=%u, floating=%d\n",
+               app, c->tags, c->isfloating);
+        fflush(stdout);
+#endif
+    }
+
+    cJSON_AddItemToObject(root, "windows", windows);
+
+    /* write to file */
+    char *json_str = cJSON_Print(root);
+    if (json_str) {
+        FILE *f = fopen(STATEFILE, "w");
+        if (f) {
+            fprintf(f, "%s", json_str);
+            fclose(f);
+#ifdef DEBUG
+            printf("mwm: state written to %s\n", STATEFILE);
+            fflush(stdout);
+#endif
+        } else {
+#ifdef DEBUG
+            printf("mwm: failed to open %s for writing: %s\n", STATEFILE, strerror(errno));
+            fflush(stdout);
+#endif
+        }
+        free(json_str);
+    }
+
+    cJSON_Delete(root);
+}
+
+static void
+loadstate(void) {
+    /* state is loaded on-demand in manage() */
+    /* this function ensures the state file exists */
+    struct stat st;
+    if (stat(STATEFILE, &st) != 0) {
+        /* create empty state file */
+        FILE *f = fopen(STATEFILE, "w");
+        if (f) {
+            fprintf(f, "{\"windows\":[]}\n");
+            fclose(f);
+        }
+    }
+}
+
+static int
+restorestate(const char *appname, unsigned int *tags, int *floating) {
+    FILE *f = fopen(STATEFILE, "r");
+    if (!f)
+        return 0;
+
+    /* read entire file */
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *json_str = malloc(fsize + 1);
+    if (!json_str) {
+        fclose(f);
+        return 0;
+    }
+
+    fread(json_str, 1, fsize, f);
+    json_str[fsize] = '\0';
+    fclose(f);
+
+    /* parse JSON */
+    cJSON *root = cJSON_Parse(json_str);
+    free(json_str);
+
+    if (!root)
+        return 0;
+
+    cJSON *windows = cJSON_GetObjectItem(root, "windows");
+    if (!windows || !cJSON_IsArray(windows)) {
+        cJSON_Delete(root);
+        return 0;
+    }
+
+    /* search for matching app */
+    int found = 0;
+    cJSON *window = NULL;
+    cJSON_ArrayForEach(window, windows) {
+        cJSON *app = cJSON_GetObjectItem(window, "app");
+        if (app && cJSON_IsString(app)) {
+            if (strcmp(app->valuestring, appname) == 0) {
+                cJSON *tags_item = cJSON_GetObjectItem(window, "tags");
+                cJSON *floating_item = cJSON_GetObjectItem(window, "floating");
+
+                if (tags_item && cJSON_IsNumber(tags_item))
+                    *tags = (unsigned int)tags_item->valueint;
+                if (floating_item && cJSON_IsNumber(floating_item))
+                    *floating = floating_item->valueint;
+
+                found = 1;
+                break;
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+    return found;
+}
+
+static void
 setup(void) {
     /* single instance check */
     if (!acquirelock()) {
@@ -972,6 +1139,9 @@ setup(void) {
     g_nmaster = DEFAULT_NMASTER;
     tagset[0] = tagset[1] = 1;
     sellay = 0;
+
+    /* load saved window state */
+    loadstate();
 
     /* signal handlers */
     signal(SIGINT, sighandler);

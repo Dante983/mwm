@@ -11,9 +11,9 @@ PREFIX = /usr/local
 BINDIR = $(PREFIX)/bin
 LAUNCHDIR = $(HOME)/Library/LaunchAgents
 
-SRC = mwm.c
+SRC = mwm.c cJSON.c
 OBJC_SRC = statusbar.m
-OBJ = mwm.o statusbar.o
+OBJ = mwm.o statusbar.o cJSON.o
 
 all: mwm
 
@@ -25,6 +25,9 @@ mwm.o: mwm.c config.h statusbar.h
 
 statusbar.o: statusbar.m statusbar.h
 	$(CC) $(OBJCFLAGS) -c -o $@ statusbar.m
+
+cJSON.o: cJSON.c cJSON.h
+	$(CC) $(CFLAGS) -c -o $@ cJSON.c
 
 clean:
 	rm -f mwm $(OBJ)
