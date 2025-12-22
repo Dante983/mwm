@@ -36,7 +36,6 @@ static int pidfd = -1;
 #define MIN(A, B)       ((A) < (B) ? (A) : (B))
 #endif
 #define TAGMASK         ((1 << LENGTH(tags)) - 1)
-#define ISVISIBLE(C)    ((C->tags & tagset[seltags]))
 
 #define TAGKEYS(KEY,TAG) \
     { MODKEY,           KEY, view,      {.ui = 1 << TAG} }, \
@@ -88,6 +87,22 @@ typedef struct {
     void (*arrange)(void);
 } Layout;
 
+typedef struct {
+    CGDirectDisplayID id;
+    CGRect rect;
+    unsigned int tags;  /* which workspaces belong to this monitor */
+    unsigned int tagset[2];  /* current and previous tag views */
+    unsigned int seltags;  /* index into tagset array */
+} Monitor;
+
+/* forward declarations needed for ISVISIBLE */
+static Monitor *monitors;
+static int nmonitors;
+
+/* ISVISIBLE checks if window is visible on ANY monitor */
+static inline int isvisible(Client *c);
+#define ISVISIBLE(C)    isvisible(C)
+
 /* function declarations */
 static void arrange(void);
 static int canmanage(AXUIElementRef win);
@@ -97,8 +112,10 @@ static void detach(Client *c);
 static void die(const char *fmt, ...);
 static void focus(Client *c);
 static void focuslast(const Arg *arg);
+static void focusleftmon(const Arg *arg);
 static void focusnext(const Arg *arg);
 static void focusprev(const Arg *arg);
+static void focusrightmon(const Arg *arg);
 static CGRect getframe(AXUIElementRef win);
 static void grabkeys(void);
 static void incnmaster(const Arg *arg);
@@ -113,6 +130,9 @@ static void loadstate(void);
 static int restorestate(const char *appname, unsigned int *tags, int *floating);
 static void savestate(void);
 static void scan(void);
+static void setupmonitors(void);
+static Monitor* getmonitor(CGRect frame);
+static Monitor* getmonitorbytags(unsigned int tags);
 static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setup(void);
@@ -138,7 +158,8 @@ static int windowschanged = 0;
 static Client *clients = NULL;
 static Client *sel = NULL;
 static Client *lastsel = NULL;
-static CGRect screen;
+static Monitor *monitors = NULL;
+static int nmonitors = 0;
 static float g_mfact;
 static int g_nmaster;
 static unsigned int seltags = 0;
@@ -155,6 +176,16 @@ die(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     exit(1);
+}
+
+static inline int
+isvisible(Client *c) {
+    /* check if window is visible on any monitor */
+    for (int i = 0; i < nmonitors; i++) {
+        if (c->tags & monitors[i].tagset[monitors[i].seltags])
+            return 1;
+    }
+    return 0;
 }
 
 static void
@@ -419,6 +450,74 @@ focuslast(const Arg *arg) {
 }
 
 static void
+focusleftmon(const Arg *arg) {
+    Monitor *m;
+    Client *c;
+
+    if (!sel || nmonitors < 2)
+        return;
+
+    /* find current monitor */
+    m = getmonitorbytags(sel->tags);
+
+    /* find the monitor to the left (geometrically) */
+    Monitor *leftmon = NULL;
+    for (int i = 0; i < nmonitors; i++) {
+        if (&monitors[i] == m)
+            continue;
+        if (monitors[i].rect.origin.x < m->rect.origin.x) {
+            if (!leftmon || monitors[i].rect.origin.x > leftmon->rect.origin.x)
+                leftmon = &monitors[i];
+        }
+    }
+
+    if (!leftmon)
+        return;
+
+    /* find first visible client on left monitor */
+    for (c = clients; c; c = c->next) {
+        if (ISVISIBLE(c) && (c->tags & leftmon->tags)) {
+            focus(c);
+            return;
+        }
+    }
+}
+
+static void
+focusrightmon(const Arg *arg) {
+    Monitor *m;
+    Client *c;
+
+    if (!sel || nmonitors < 2)
+        return;
+
+    /* find current monitor */
+    m = getmonitorbytags(sel->tags);
+
+    /* find the monitor to the right (geometrically) */
+    Monitor *rightmon = NULL;
+    for (int i = 0; i < nmonitors; i++) {
+        if (&monitors[i] == m)
+            continue;
+        if (monitors[i].rect.origin.x > m->rect.origin.x) {
+            if (!rightmon || monitors[i].rect.origin.x < rightmon->rect.origin.x)
+                rightmon = &monitors[i];
+        }
+    }
+
+    if (!rightmon)
+        return;
+
+    /* find first visible client on right monitor */
+    for (c = clients; c; c = c->next) {
+        if (ISVISIBLE(c) && (c->tags & rightmon->tags)) {
+            focus(c);
+            return;
+        }
+    }
+}
+
+static void
 swapnext(const Arg *arg) {
     Client *c;
 
@@ -513,34 +612,48 @@ togglefloat(const Arg *arg) {
 
 static void
 view(const Arg *arg) {
-    if ((arg->ui & TAGMASK) == tagset[seltags])
+    unsigned int newtags = arg->ui & TAGMASK;
+
+    /* find which monitor owns this workspace */
+    Monitor *m = getmonitorbytags(newtags);
+
+    /* check if this monitor is already viewing this tag */
+    if (m->tagset[m->seltags] == newtags)
         return;
-    seltags ^= 1;
-    tagset[seltags] = arg->ui & TAGMASK;
+
+    /* switch this monitor's view */
+    m->seltags ^= 1;
+    m->tagset[m->seltags] = newtags;
 
 #ifdef DEBUG
-    printf("mwm: switching to tag %u\n", tagset[seltags]);
+    printf("mwm: switching monitor %d to tag %u\n",
+           (int)(m - monitors), newtags);
     fflush(stdout);
 #endif
 
     windowschanged = 1;
     arrange();
 
-    /* focus first visible client */
+    /* focus first visible client on this monitor */
     Client *c;
     for (c = clients; c; c = c->next) {
-        if (ISVISIBLE(c)) {
+        if (ISVISIBLE(c) && (c->tags & m->tags)) {
             focus(c);
-            break;
+            return;
         }
     }
 }
 
 static void
 toggleview(const Arg *arg) {
-    unsigned int newtagset = tagset[seltags] ^ (arg->ui & TAGMASK);
-    if (newtagset) {
-        tagset[seltags] = newtagset;
+    unsigned int newtags = arg->ui & TAGMASK;
+
+    /* find which monitor owns this workspace */
+    Monitor *m = getmonitorbytags(newtags);
+
+    unsigned int newtagset = m->tagset[m->seltags] ^ newtags;
+    if (newtagset && (newtagset & m->tags)) {
+        m->tagset[m->seltags] = newtagset;
         windowschanged = 1;
         arrange();
     }
@@ -572,62 +685,75 @@ tag(const Arg *arg) {
 
 static void
 tile(void) {
-    unsigned int n = 0, i = 0;
     Client *c;
-    int mx, my, mw, mh;
-    int sx, sy, sw, sh;
     int gap = gappx;
 
-    /* count tiled clients */
-    for (c = clients; c; c = c->next)
-        if (ISVISIBLE(c) && !c->isfloating)
-            n++;
+    /* tile windows on each monitor separately */
+    for (int mon = 0; mon < nmonitors; mon++) {
+        Monitor *m = &monitors[mon];
+        unsigned int n = 0, i = 0;
+        int mx, my, mw, mh;
+        int sx, sy, sw, sh;
 
-    if (n == 0)
-        return;
-
-    /* calculate areas */
-    mx = screen.origin.x + gap;
-    my = screen.origin.y + gap;
-
-    if (n <= (unsigned int)g_nmaster) {
-        /* all in master */
-        mw = screen.size.width - 2 * gap;
-        mh = (screen.size.height - (n + 1) * gap) / n;
-    } else {
-        /* master + stack */
-        mw = (screen.size.width - 3 * gap) * g_mfact;
-        mh = (screen.size.height - (g_nmaster + 1) * gap) / g_nmaster;
-        sx = mx + mw + gap;
-        sy = my;
-        sw = screen.size.width - mw - 3 * gap;
-        sh = (screen.size.height - (n - g_nmaster + 1) * gap) / (n - g_nmaster);
-    }
-
-    /* arrange clients */
-    for (c = clients; c; c = c->next) {
-        if (!ISVISIBLE(c))
-            continue;
-
-        if (c->isfloating)
-            continue;
-
-        if (i < (unsigned int)g_nmaster) {
-            /* master area */
-            CGPoint pos = CGPointMake(mx, my + i * (mh + gap));
-            CGSize size = CGSizeMake(n <= (unsigned int)g_nmaster ? mw : mw, mh);
-            movewindow(c->win, pos);
-            resizewindow(c->win, size);
-            c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
-        } else {
-            /* stack area */
-            CGPoint pos = CGPointMake(sx, sy + (i - g_nmaster) * (sh + gap));
-            CGSize size = CGSizeMake(sw, sh);
-            movewindow(c->win, pos);
-            resizewindow(c->win, size);
-            c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+        /* count tiled clients on this monitor */
+        for (c = clients; c; c = c->next) {
+            if (ISVISIBLE(c) && !c->isfloating) {
+                /* check if window's tags match this monitor's tags */
+                if (c->tags & m->tags)
+                    n++;
+            }
         }
-        i++;
+
+        if (n == 0)
+            continue;
+
+        /* calculate areas for this monitor */
+        mx = m->rect.origin.x + gap;
+        my = m->rect.origin.y + gap;
+
+        if (n <= (unsigned int)g_nmaster) {
+            /* all in master */
+            mw = m->rect.size.width - 2 * gap;
+            mh = (m->rect.size.height - (n + 1) * gap) / n;
+        } else {
+            /* master + stack */
+            mw = (m->rect.size.width - 3 * gap) * g_mfact;
+            mh = (m->rect.size.height - (g_nmaster + 1) * gap) / g_nmaster;
+            sx = mx + mw + gap;
+            sy = my;
+            sw = m->rect.size.width - mw - 3 * gap;
+            sh = (m->rect.size.height - (n - g_nmaster + 1) * gap) / (n - g_nmaster);
+        }
+
+        /* arrange clients on this monitor */
+        for (c = clients; c; c = c->next) {
+            if (!ISVISIBLE(c))
+                continue;
+
+            if (c->isfloating)
+                continue;
+
+            /* check if window's tags match this monitor's tags */
+            if (!(c->tags & m->tags))
+                continue;
+
+            if (i < (unsigned int)g_nmaster) {
+                /* master area */
+                CGPoint pos = CGPointMake(mx, my + i * (mh + gap));
+                CGSize size = CGSizeMake(n <= (unsigned int)g_nmaster ? mw : mw, mh);
+                movewindow(c->win, pos);
+                resizewindow(c->win, size);
+                c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+            } else {
+                /* stack area */
+                CGPoint pos = CGPointMake(sx, sy + (i - g_nmaster) * (sh + gap));
+                CGSize size = CGSizeMake(sw, sh);
+                movewindow(c->win, pos);
+                resizewindow(c->win, size);
+                c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+            }
+            i++;
+        }
     }
 }
 
@@ -636,15 +762,24 @@ monocle(void) {
     Client *c;
     int gap = gappx;
 
-    for (c = clients; c; c = c->next) {
-        if (!ISVISIBLE(c) || c->isfloating)
-            continue;
+    /* maximize windows on each monitor separately */
+    for (int mon = 0; mon < nmonitors; mon++) {
+        Monitor *m = &monitors[mon];
 
-        CGPoint pos = CGPointMake(screen.origin.x + gap, screen.origin.y + gap);
-        CGSize size = CGSizeMake(screen.size.width - 2 * gap, screen.size.height - 2 * gap);
-        movewindow(c->win, pos);
-        resizewindow(c->win, size);
-        c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+        for (c = clients; c; c = c->next) {
+            if (!ISVISIBLE(c) || c->isfloating)
+                continue;
+
+            /* check if window's tags match this monitor's tags */
+            if (!(c->tags & m->tags))
+                continue;
+
+            CGPoint pos = CGPointMake(m->rect.origin.x + gap, m->rect.origin.y + gap);
+            CGSize size = CGSizeMake(m->rect.size.width - 2 * gap, m->rect.size.height - 2 * gap);
+            movewindow(c->win, pos);
+            resizewindow(c->win, size);
+            c->frame = CGRectMake(pos.x, pos.y, size.width, size.height);
+        }
     }
 }
 
@@ -1096,6 +1231,82 @@ restorestate(const char *appname, unsigned int *tags, int *floating) {
 }
 
 static void
+setupmonitors(void) {
+    CGDirectDisplayID displays[32];
+    uint32_t count = 0;
+
+    /* get all active displays */
+    if (CGGetActiveDisplayList(32, displays, &count) != kCGErrorSuccess) {
+        die("mwm: cannot get display list\n");
+    }
+
+    nmonitors = (int)count;
+    monitors = calloc(nmonitors, sizeof(Monitor));
+    if (!monitors) {
+        die("mwm: cannot allocate monitors\n");
+    }
+
+    /* get bounds for each display */
+    for (int i = 0; i < nmonitors; i++) {
+        monitors[i].id = displays[i];
+        monitors[i].rect = CGDisplayBounds(displays[i]);
+
+        /* adjust for menu bar on main display */
+        if (CGDisplayIsMain(displays[i])) {
+            monitors[i].rect.origin.y += 25;
+            monitors[i].rect.size.height -= 25;
+            /* approximate dock height */
+            monitors[i].rect.size.height -= 70;
+            /* main monitor gets workspaces 1-5 */
+            monitors[i].tags = 0b11111;  /* tags 1,2,4,8,16 = workspaces 1-5 */
+            /* start viewing workspace 1 on main monitor */
+            monitors[i].tagset[0] = monitors[i].tagset[1] = 1;
+            monitors[i].seltags = 0;
+        } else {
+            /* secondary monitor gets workspaces 6-9 */
+            monitors[i].tags = 0b111100000;  /* tags 32,64,128,256 = workspaces 6-9 */
+            /* start viewing workspace 6 on secondary monitor */
+            monitors[i].tagset[0] = monitors[i].tagset[1] = 32;
+            monitors[i].seltags = 0;
+        }
+
+        printf("mwm: monitor %d: %.0fx%.0f @ (%.0f,%.0f)%s (tags=%u)\n",
+               i, monitors[i].rect.size.width, monitors[i].rect.size.height,
+               monitors[i].rect.origin.x, monitors[i].rect.origin.y,
+               CGDisplayIsMain(displays[i]) ? " (main)" : "", monitors[i].tags);
+    }
+}
+
+static Monitor*
+getmonitor(CGRect frame) {
+    /* find the monitor that contains most of the window */
+    Monitor *best = &monitors[0];
+    double maxoverlap = 0;
+
+    for (int i = 0; i < nmonitors; i++) {
+        CGRect intersection = CGRectIntersection(frame, monitors[i].rect);
+        double overlap = intersection.size.width * intersection.size.height;
+        if (overlap > maxoverlap) {
+            maxoverlap = overlap;
+            best = &monitors[i];
+        }
+    }
+
+    return best;
+}
+
+static Monitor*
+getmonitorbytags(unsigned int tags) {
+    /* find the monitor that owns these tags/workspaces */
+    for (int i = 0; i < nmonitors; i++) {
+        if (tags & monitors[i].tags)
+            return &monitors[i];
+    }
+    /* default to first monitor if no match */
+    return &monitors[0];
+}
+
+static void
 setup(void) {
     /* single instance check */
     if (!acquirelock()) {
@@ -1122,17 +1333,8 @@ setup(void) {
         fprintf(stderr, "     and add mwm to the allowed apps.\n");
     }
 
-    /* get screen size */
-    CGDirectDisplayID mainDisplay = CGMainDisplayID();
-    screen = CGDisplayBounds(mainDisplay);
-
-    /* account for menu bar (approximate) */
-    screen.origin.y += 25;
-    screen.size.height -= 25;
-
-    /* get dock info and adjust */
-    /* TODO: properly detect dock position and size */
-    screen.size.height -= 70;  /* approximate dock height */
+    /* detect all monitors */
+    setupmonitors();
 
     /* initialize state */
     g_mfact = DEFAULT_MFACT;
@@ -1154,9 +1356,6 @@ setup(void) {
     statusbar_init();
 
     printf("mwm: started\n");
-    printf("     screen: %.0fx%.0f @ (%.0f,%.0f)\n",
-           screen.size.width, screen.size.height,
-           screen.origin.x, screen.origin.y);
 }
 
 static void
@@ -1176,6 +1375,9 @@ cleanup(void) {
     }
     if (evtap)
         CFRelease(evtap);
+
+    if (monitors)
+        free(monitors);
 
     statusbar_cleanup();
     releaselock();

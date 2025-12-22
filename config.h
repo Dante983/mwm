@@ -67,6 +67,8 @@ static const char *termcmd[] = { "/Applications/Ghostty.app", NULL };
 #define Key_8       0x1C
 #define Key_9       0x19
 #define Key_0       0x1D
+#define Key_Comma   0x2B
+#define Key_Period  0x2F
 
 /* tags/workspaces */
 static const char *tags[] = { "1", "2", "3", "4", "5", "6", "7", "8", "9" };
@@ -109,6 +111,8 @@ static Key keys[] = {
     { MODKEY,           Key_Space,  cyclelayout,    {0} },
     { MODKEY|ShiftMask, Key_Space,  togglefloat,    {0} },
     { MODKEY,           Key_Tab,    focuslast,      {0} },
+    { MODKEY,           Key_Comma,  focusleftmon,   {0} },
+    { MODKEY,           Key_Period, focusrightmon,  {0} },
     TAGKEYS(            Key_1,                      0)
     TAGKEYS(            Key_2,                      1)
     TAGKEYS(            Key_3,                      2)
